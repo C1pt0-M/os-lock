@@ -27,10 +27,23 @@ extern int max_lock_depth; /* for sysctl */
  *              caches top-waiter (leftmost node).
  * @owner:	the mutex owner
  */
+#ifdef CONFIG_MUTEX_PI
+/* Immutable for a published lock; does not mean the lock is held. */
+#define RT_MUTEX_PI_TAG		8UL
+#else
+#define RT_MUTEX_PI_TAG		0UL
+#endif
+
 struct rt_mutex {
+#ifdef CONFIG_MUTEX_PI
+	/* Shares the owner word with the non-PI backend of struct mutex. */
+	struct task_struct	*owner;
+#endif
 	raw_spinlock_t		wait_lock;
 	struct rb_root_cached   waiters;
+#ifndef CONFIG_MUTEX_PI
 	struct task_struct	*owner;
+#endif
 #ifdef CONFIG_DEBUG_RT_MUTEXES
 	int			save_state;
 	const char		*name, *file;
@@ -82,12 +95,15 @@ do { \
 #define __DEP_MAP_RT_MUTEX_INITIALIZER(mutexname)
 #endif
 
-#define __RT_MUTEX_INITIALIZER(mutexname) \
+#define __RT_MUTEX_INITIALIZER_TAG(mutexname, tag) \
 	{ .wait_lock = __RAW_SPIN_LOCK_UNLOCKED(mutexname.wait_lock) \
 	, .waiters = RB_ROOT_CACHED \
-	, .owner = NULL \
+	, .owner = (struct task_struct *)(tag) \
 	__DEBUG_RT_MUTEX_INITIALIZER(mutexname) \
 	__DEP_MAP_RT_MUTEX_INITIALIZER(mutexname)}
+
+#define __RT_MUTEX_INITIALIZER(mutexname) \
+	__RT_MUTEX_INITIALIZER_TAG(mutexname, 0)
 
 #define DEFINE_RT_MUTEX(mutexname) \
 	struct rt_mutex mutexname = __RT_MUTEX_INITIALIZER(mutexname)
@@ -100,7 +116,7 @@ do { \
  */
 static inline int rt_mutex_is_locked(struct rt_mutex *lock)
 {
-	return lock->owner != NULL;
+	return ((unsigned long)READ_ONCE(lock->owner) & ~RT_MUTEX_PI_TAG) != 0;
 }
 
 extern void __rt_mutex_init(struct rt_mutex *lock, const char *name, struct lock_class_key *key);

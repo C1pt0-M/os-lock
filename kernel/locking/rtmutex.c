@@ -26,7 +26,9 @@
  * lock->owner state tracking:
  *
  * lock->owner holds the task_struct pointer of the owner. Bit 0
- * is used to keep track of the "lock has waiters" state.
+ * is used to keep track of the "lock has waiters" state. The optional
+ * RT_MUTEX_PI_TAG is immutable and independent of owner/waiter state. The
+ * state table and transition examples below omit this tag for clarity.
  *
  * owner	bit0
  * NULL		0	lock is free (fast acquire possible)
@@ -49,10 +51,15 @@
  * set this bit before looking at the lock.
  */
 
+static inline unsigned long rt_mutex_owner_tag(struct rt_mutex *lock)
+{
+	return (unsigned long)READ_ONCE(lock->owner) & RT_MUTEX_PI_TAG;
+}
+
 static void
 rt_mutex_set_owner(struct rt_mutex *lock, struct task_struct *owner)
 {
-	unsigned long val = (unsigned long)owner;
+	unsigned long val = (unsigned long)owner | rt_mutex_owner_tag(lock);
 
 	if (rt_mutex_has_waiters(lock))
 		val |= RT_MUTEX_HAS_WAITERS;
@@ -141,8 +148,25 @@ static void fixup_rt_mutex_waiters(struct rt_mutex *lock)
  * set up.
  */
 #ifndef CONFIG_DEBUG_RT_MUTEXES
-# define rt_mutex_cmpxchg_acquire(l,c,n) (cmpxchg_acquire(&l->owner, c, n) == c)
-# define rt_mutex_cmpxchg_release(l,c,n) (cmpxchg_release(&l->owner, c, n) == c)
+static inline bool rt_mutex_cmpxchg_acquire(struct rt_mutex *lock,
+					    struct task_struct *old,
+					    struct task_struct *new,
+					    unsigned long tag)
+{
+	old = (void *)((unsigned long)old | tag);
+	new = (void *)((unsigned long)new | tag);
+	return cmpxchg_acquire(&lock->owner, old, new) == old;
+}
+
+static inline bool rt_mutex_cmpxchg_release(struct rt_mutex *lock,
+					    struct task_struct *old,
+					    struct task_struct *new,
+					    unsigned long tag)
+{
+	old = (void *)((unsigned long)old | tag);
+	new = (void *)((unsigned long)new | tag);
+	return cmpxchg_release(&lock->owner, old, new) == old;
+}
 
 /*
  * Callers must hold the ->wait_lock -- which is the whole purpose as we force
@@ -170,6 +194,7 @@ static inline bool unlock_rt_mutex_safe(struct rt_mutex *lock,
 	__releases(lock->wait_lock)
 {
 	struct task_struct *owner = rt_mutex_owner(lock);
+	unsigned long tag = rt_mutex_owner_tag(lock);
 
 	clear_rt_mutex_waiters(lock);
 	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
@@ -197,12 +222,12 @@ static inline bool unlock_rt_mutex_safe(struct rt_mutex *lock,
 	 *					lock(wait_lock);
 	 *					acquire(lock);
 	 */
-	return rt_mutex_cmpxchg_release(lock, owner, NULL);
+	return rt_mutex_cmpxchg_release(lock, owner, NULL, tag);
 }
 
 #else
-# define rt_mutex_cmpxchg_acquire(l,c,n)	(0)
-# define rt_mutex_cmpxchg_release(l,c,n)	(0)
+# define rt_mutex_cmpxchg_acquire(l, c, n, tag)	(0)
+# define rt_mutex_cmpxchg_release(l, c, n, tag)	(0)
 
 static inline void mark_rt_mutex_waiters(struct rt_mutex *lock)
 {
@@ -217,7 +242,7 @@ static inline bool unlock_rt_mutex_safe(struct rt_mutex *lock,
 					unsigned long flags)
 	__releases(lock->wait_lock)
 {
-	lock->owner = NULL;
+	rt_mutex_set_owner(lock, NULL);
 	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
 	return true;
 }
@@ -1039,7 +1064,7 @@ static void mark_wakeup_next_waiter(struct wake_q_head *wake_q,
 	 * slow path making sure no task of lower priority than
 	 * the top waiter can steal this lock.
 	 */
-	lock->owner = (void *) RT_MUTEX_HAS_WAITERS;
+	lock->owner = (void *)(RT_MUTEX_HAS_WAITERS | rt_mutex_owner_tag(lock));
 
 	/*
 	 * We deboosted before waking the top waiter task such that we don't
@@ -1402,12 +1427,12 @@ static bool __sched rt_mutex_slowunlock(struct rt_mutex *lock,
  * architecture does not support cmpxchg or when debugging is enabled.
  */
 static inline int
-rt_mutex_fastlock(struct rt_mutex *lock, int state,
+rt_mutex_fastlock(struct rt_mutex *lock, int state, unsigned long tag,
 		  int (*slowfn)(struct rt_mutex *lock, int state,
 				struct hrtimer_sleeper *timeout,
 				enum rtmutex_chainwalk chwalk))
 {
-	if (likely(rt_mutex_cmpxchg_acquire(lock, NULL, current)))
+	if (likely(rt_mutex_cmpxchg_acquire(lock, NULL, current, tag)))
 		return 0;
 
 	return slowfn(lock, state, NULL, RT_MUTEX_MIN_CHAINWALK);
@@ -1422,17 +1447,17 @@ rt_mutex_timed_fastlock(struct rt_mutex *lock, int state,
 				      enum rtmutex_chainwalk chwalk))
 {
 	if (chwalk == RT_MUTEX_MIN_CHAINWALK &&
-	    likely(rt_mutex_cmpxchg_acquire(lock, NULL, current)))
+	    likely(rt_mutex_cmpxchg_acquire(lock, NULL, current, 0)))
 		return 0;
 
 	return slowfn(lock, state, timeout, chwalk);
 }
 
 static inline int
-rt_mutex_fasttrylock(struct rt_mutex *lock,
+rt_mutex_fasttrylock(struct rt_mutex *lock, unsigned long tag,
 		     int (*slowfn)(struct rt_mutex *lock))
 {
-	if (likely(rt_mutex_cmpxchg_acquire(lock, NULL, current)))
+	if (likely(rt_mutex_cmpxchg_acquire(lock, NULL, current, tag)))
 		return 1;
 
 	return slowfn(lock);
@@ -1450,13 +1475,13 @@ void rt_mutex_postunlock(struct wake_q_head *wake_q)
 }
 
 static inline void
-rt_mutex_fastunlock(struct rt_mutex *lock,
+rt_mutex_fastunlock(struct rt_mutex *lock, unsigned long tag,
 		    bool (*slowfn)(struct rt_mutex *lock,
 				   struct wake_q_head *wqh))
 {
 	DEFINE_WAKE_Q(wake_q);
 
-	if (likely(rt_mutex_cmpxchg_release(lock, current, NULL)))
+	if (likely(rt_mutex_cmpxchg_release(lock, current, NULL, tag)))
 		return;
 
 	if (slowfn(lock, &wake_q))
@@ -1467,7 +1492,7 @@ rt_mutex_fastunlock(struct rt_mutex *lock,
 /* Called with lockdep ownership recorded on the outer struct mutex. */
 int __sched rt_mutex_lock_nolockdep(struct rt_mutex *lock, int state)
 {
-	return rt_mutex_fastlock(lock, state, rt_mutex_slowlock);
+	return rt_mutex_fastlock(lock, state, RT_MUTEX_PI_TAG, rt_mutex_slowlock);
 }
 
 int __sched rt_mutex_trylock_nolockdep(struct rt_mutex *lock)
@@ -1475,12 +1500,12 @@ int __sched rt_mutex_trylock_nolockdep(struct rt_mutex *lock)
 	if (WARN_ON_ONCE(in_irq() || in_nmi() || in_serving_softirq()))
 		return 0;
 
-	return rt_mutex_fasttrylock(lock, rt_mutex_slowtrylock);
+	return rt_mutex_fasttrylock(lock, RT_MUTEX_PI_TAG, rt_mutex_slowtrylock);
 }
 
 void __sched rt_mutex_unlock_nolockdep(struct rt_mutex *lock)
 {
-	rt_mutex_fastunlock(lock, rt_mutex_slowunlock);
+	rt_mutex_fastunlock(lock, RT_MUTEX_PI_TAG, rt_mutex_slowunlock);
 }
 #endif
 
@@ -1489,7 +1514,7 @@ static inline void __rt_mutex_lock(struct rt_mutex *lock, unsigned int subclass)
 	might_sleep();
 
 	mutex_acquire(&lock->dep_map, subclass, 0, _RET_IP_);
-	rt_mutex_fastlock(lock, TASK_UNINTERRUPTIBLE, rt_mutex_slowlock);
+	rt_mutex_fastlock(lock, TASK_UNINTERRUPTIBLE, 0, rt_mutex_slowlock);
 }
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
@@ -1535,7 +1560,7 @@ int __sched rt_mutex_lock_interruptible(struct rt_mutex *lock)
 	might_sleep();
 
 	mutex_acquire(&lock->dep_map, 0, 0, _RET_IP_);
-	ret = rt_mutex_fastlock(lock, TASK_INTERRUPTIBLE, rt_mutex_slowlock);
+	ret = rt_mutex_fastlock(lock, TASK_INTERRUPTIBLE, 0, rt_mutex_slowlock);
 	if (ret)
 		mutex_release(&lock->dep_map, _RET_IP_);
 
@@ -1605,7 +1630,7 @@ int __sched rt_mutex_trylock(struct rt_mutex *lock)
 	if (WARN_ON_ONCE(in_irq() || in_nmi() || in_serving_softirq()))
 		return 0;
 
-	ret = rt_mutex_fasttrylock(lock, rt_mutex_slowtrylock);
+	ret = rt_mutex_fasttrylock(lock, 0, rt_mutex_slowtrylock);
 	if (ret)
 		mutex_acquire(&lock->dep_map, 0, 1, _RET_IP_);
 
@@ -1621,7 +1646,7 @@ EXPORT_SYMBOL_GPL(rt_mutex_trylock);
 void __sched rt_mutex_unlock(struct rt_mutex *lock)
 {
 	mutex_release(&lock->dep_map, _RET_IP_);
-	rt_mutex_fastunlock(lock, rt_mutex_slowunlock);
+	rt_mutex_fastunlock(lock, 0, rt_mutex_slowunlock);
 }
 EXPORT_SYMBOL_GPL(rt_mutex_unlock);
 

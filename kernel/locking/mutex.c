@@ -39,12 +39,16 @@
 #ifdef CONFIG_MUTEX_PI
 #include "rtmutex_common.h"
 
+static_assert(L1_CACHE_BYTES >= 2 * RT_MUTEX_PI_TAG);
+static_assert(offsetof(struct mutex, owner) == offsetof(struct mutex, pi_lock.owner));
+static_assert(sizeof_field(struct mutex, owner) == sizeof_field(struct rt_mutex, owner));
+
 void __mutex_init_pi(struct mutex *lock, const char *name,
 		     struct lock_class_key *key)
 {
 	__rt_mutex_init(&lock->pi_lock, name, key);
 	debug_mutex_init(lock, name, key);
-	lock->pi_enabled = true;
+	lock->pi_lock.owner = (struct task_struct *)RT_MUTEX_PI_TAG;
 }
 EXPORT_SYMBOL(__mutex_init_pi);
 #endif
@@ -52,7 +56,7 @@ EXPORT_SYMBOL(__mutex_init_pi);
 static inline bool mutex_uses_pi(const struct mutex *lock)
 {
 #ifdef CONFIG_MUTEX_PI
-	return lock->pi_enabled;
+	return atomic_long_read(&lock->owner) & RT_MUTEX_PI_TAG;
 #else
 	return false;
 #endif
@@ -61,9 +65,6 @@ static inline bool mutex_uses_pi(const struct mutex *lock)
 void
 __mutex_init(struct mutex *lock, const char *name, struct lock_class_key *key)
 {
-#ifdef CONFIG_MUTEX_PI
-	lock->pi_enabled = false;
-#endif
 	atomic_long_set(&lock->owner, 0);
 	spin_lock_init(&lock->wait_lock);
 	INIT_LIST_HEAD(&lock->wait_list);
@@ -89,6 +90,9 @@ EXPORT_SYMBOL(__mutex_init);
 #define MUTEX_FLAG_PICKUP	0x04
 
 #define MUTEX_FLAGS		0x07
+#ifdef CONFIG_MUTEX_PI
+static_assert(!(MUTEX_FLAGS & RT_MUTEX_PI_TAG));
+#endif
 
 /*
  * Internal helper function; C doesn't allow us to hide it :/

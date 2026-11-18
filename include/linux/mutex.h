@@ -56,8 +56,6 @@ struct ww_acquire_ctx;
  */
 struct mutex {
 #ifdef CONFIG_MUTEX_PI
-	/* The backend is fixed until the next initialization. */
-	bool			pi_enabled;
 	union {
 		struct rt_mutex	pi_lock;
 		struct {
@@ -169,8 +167,8 @@ do {									\
 
 #define DEFINE_MUTEX_PI(lockname)					\
 	struct mutex lockname = {					\
-		.pi_enabled = true,					\
-		.pi_lock = __RT_MUTEX_INITIALIZER(lockname.pi_lock)	\
+		.pi_lock = __RT_MUTEX_INITIALIZER_TAG(lockname.pi_lock,	\
+						     RT_MUTEX_PI_TAG)	\
 		__DEBUG_MUTEX_INITIALIZER(lockname)			\
 		__DEP_MAP_MUTEX_INITIALIZER(lockname)			\
 	}
