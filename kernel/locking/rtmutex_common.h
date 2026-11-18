@@ -127,6 +127,13 @@ enum rtmutex_chainwalk {
 	RT_MUTEX_FULL_CHAINWALK,
 };
 
+/* The mutex API accounts for lockdep on struct mutex, not the backend. */
+#ifdef CONFIG_MUTEX_PI
+int rt_mutex_lock_nolockdep(struct rt_mutex *lock, int state);
+int rt_mutex_trylock_nolockdep(struct rt_mutex *lock);
+void rt_mutex_unlock_nolockdep(struct rt_mutex *lock);
+#endif
+
 /*
  * PI-futex support (proxy locking functions, etc.):
  */

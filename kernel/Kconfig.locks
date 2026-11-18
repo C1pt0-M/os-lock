@@ -228,6 +228,15 @@ config MUTEX_SPIN_ON_OWNER
 	def_bool y
 	depends on SMP && ARCH_SUPPORTS_ATOMIC_RMW
 
+config MUTEX_PI
+	bool "Opt-in priority inheritance for mutexes"
+	depends on RT_MUTEXES
+	help
+	  Enable priority inheritance for kernel mutexes explicitly initialized
+	  with mutex_init_pi() or DEFINE_MUTEX_PI(). Existing mutexes, including
+	  ww_mutexes, continue to use the normal mutex implementation.
+	  Without this option both PI initializers create normal mutexes.
+
 config RWSEM_SPIN_ON_OWNER
        def_bool y
        depends on SMP && ARCH_SUPPORTS_ATOMIC_RMW

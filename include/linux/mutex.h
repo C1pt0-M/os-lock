@@ -20,6 +20,9 @@
 #include <linux/osq_lock.h>
 #include <linux/debug_locks.h>
 #include <linux/cleanup.h>
+#ifdef CONFIG_MUTEX_PI
+#include <linux/rtmutex.h>
+#endif
 
 struct ww_acquire_ctx;
 
@@ -52,12 +55,23 @@ struct ww_acquire_ctx;
  *   locks and tasks (and only those tasks)
  */
 struct mutex {
+#ifdef CONFIG_MUTEX_PI
+	/* The backend is fixed until the next initialization. */
+	bool			pi_enabled;
+	union {
+		struct rt_mutex	pi_lock;
+		struct {
+#endif
 	atomic_long_t		owner;
 	spinlock_t		wait_lock;
 #ifdef CONFIG_MUTEX_SPIN_ON_OWNER
 	struct optimistic_spin_queue osq; /* Spinner MCS lock */
 #endif
 	struct list_head	wait_list;
+#ifdef CONFIG_MUTEX_PI
+		};
+	};
+#endif
 #ifdef CONFIG_DEBUG_MUTEXES
 	void			*magic;
 #endif
@@ -142,6 +156,28 @@ do {									\
 
 extern void __mutex_init(struct mutex *lock, const char *name,
 			 struct lock_class_key *key);
+
+#ifdef CONFIG_MUTEX_PI
+extern void __mutex_init_pi(struct mutex *lock, const char *name,
+			    struct lock_class_key *key);
+
+#define mutex_init_pi(mutex)						\
+do {									\
+	static struct lock_class_key __key;				\
+	__mutex_init_pi((mutex), #mutex, &__key);				\
+} while (0)
+
+#define DEFINE_MUTEX_PI(lockname)					\
+	struct mutex lockname = {					\
+		.pi_enabled = true,					\
+		.pi_lock = __RT_MUTEX_INITIALIZER(lockname.pi_lock)	\
+		__DEBUG_MUTEX_INITIALIZER(lockname)			\
+		__DEP_MAP_MUTEX_INITIALIZER(lockname)			\
+	}
+#else
+#define mutex_init_pi(mutex)	mutex_init(mutex)
+#define DEFINE_MUTEX_PI(name)	DEFINE_MUTEX(name)
+#endif
 
 /**
  * mutex_is_locked - is the mutex locked

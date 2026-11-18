@@ -36,9 +36,34 @@
 # include "mutex.h"
 #endif
 
+#ifdef CONFIG_MUTEX_PI
+#include "rtmutex_common.h"
+
+void __mutex_init_pi(struct mutex *lock, const char *name,
+		     struct lock_class_key *key)
+{
+	__rt_mutex_init(&lock->pi_lock, name, key);
+	debug_mutex_init(lock, name, key);
+	lock->pi_enabled = true;
+}
+EXPORT_SYMBOL(__mutex_init_pi);
+#endif
+
+static inline bool mutex_uses_pi(const struct mutex *lock)
+{
+#ifdef CONFIG_MUTEX_PI
+	return lock->pi_enabled;
+#else
+	return false;
+#endif
+}
+
 void
 __mutex_init(struct mutex *lock, const char *name, struct lock_class_key *key)
 {
+#ifdef CONFIG_MUTEX_PI
+	lock->pi_enabled = false;
+#endif
 	atomic_long_set(&lock->owner, 0);
 	spin_lock_init(&lock->wait_lock);
 	INIT_LIST_HEAD(&lock->wait_list);
@@ -72,6 +97,10 @@ EXPORT_SYMBOL(__mutex_init);
  */
 static inline struct task_struct *__mutex_owner(struct mutex *lock)
 {
+#ifdef CONFIG_MUTEX_PI
+	if (mutex_uses_pi(lock))
+		return rt_mutex_owner(&lock->pi_lock);
+#endif
 	return (struct task_struct *)(atomic_long_read(&lock->owner) & ~MUTEX_FLAGS);
 }
 
@@ -290,7 +319,7 @@ void __sched mutex_lock(struct mutex *lock)
 {
 	might_sleep();
 
-	if (!__mutex_trylock_fast(lock))
+	if (mutex_uses_pi(lock) || !__mutex_trylock_fast(lock))
 		__mutex_lock_slowpath(lock);
 }
 EXPORT_SYMBOL(mutex_lock);
@@ -743,6 +772,16 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
  */
 void __sched mutex_unlock(struct mutex *lock)
 {
+#ifdef CONFIG_MUTEX_PI
+	if (mutex_uses_pi(lock)) {
+#ifdef CONFIG_DEBUG_MUTEXES
+		DEBUG_LOCKS_WARN_ON(lock->magic != lock);
+#endif
+		mutex_release(&lock->dep_map, _RET_IP_);
+		rt_mutex_unlock_nolockdep(&lock->pi_lock);
+		return;
+	}
+#endif
 #ifndef CONFIG_DEBUG_LOCK_ALLOC
 	if (__mutex_unlock_fast(lock))
 		return;
@@ -1106,6 +1145,21 @@ static int __sched
 __mutex_lock(struct mutex *lock, long state, unsigned int subclass,
 	     struct lockdep_map *nest_lock, unsigned long ip)
 {
+#ifdef CONFIG_MUTEX_PI
+	if (mutex_uses_pi(lock)) {
+		int ret;
+
+		might_sleep();
+#ifdef CONFIG_DEBUG_MUTEXES
+		DEBUG_LOCKS_WARN_ON(lock->magic != lock);
+#endif
+		mutex_acquire_nest(&lock->dep_map, subclass, 0, nest_lock, ip);
+		ret = rt_mutex_lock_nolockdep(&lock->pi_lock, state);
+		if (ret)
+			mutex_release(&lock->dep_map, ip);
+		return ret;
+	}
+#endif
 	return __mutex_lock_common(lock, state, subclass, nest_lock, ip, NULL, false);
 }
 
@@ -1313,7 +1367,7 @@ int __sched mutex_lock_interruptible(struct mutex *lock)
 {
 	might_sleep();
 
-	if (__mutex_trylock_fast(lock))
+	if (!mutex_uses_pi(lock) && __mutex_trylock_fast(lock))
 		return 0;
 
 	return __mutex_lock_interruptible_slowpath(lock);
@@ -1337,7 +1391,7 @@ int __sched mutex_lock_killable(struct mutex *lock)
 {
 	might_sleep();
 
-	if (__mutex_trylock_fast(lock))
+	if (!mutex_uses_pi(lock) && __mutex_trylock_fast(lock))
 		return 0;
 
 	return __mutex_lock_killable_slowpath(lock);
@@ -1421,7 +1475,12 @@ int __sched mutex_trylock(struct mutex *lock)
 	DEBUG_LOCKS_WARN_ON(lock->magic != lock);
 #endif
 
-	locked = __mutex_trylock(lock);
+#ifdef CONFIG_MUTEX_PI
+	if (mutex_uses_pi(lock))
+		locked = rt_mutex_trylock_nolockdep(&lock->pi_lock);
+	else
+#endif
+		locked = __mutex_trylock(lock);
 	if (locked)
 		mutex_acquire(&lock->dep_map, 0, 1, _RET_IP_);
 

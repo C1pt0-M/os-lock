@@ -1179,19 +1179,12 @@ __rt_mutex_slowlock(struct rt_mutex *lock, int state,
 		if (try_to_take_rt_mutex(lock, current, waiter))
 			break;
 
-		/*
-		 * TASK_INTERRUPTIBLE checks for signals and
-		 * timeout. Ignored otherwise.
-		 */
-		if (likely(state == TASK_INTERRUPTIBLE)) {
-			/* Signal pending? */
-			if (signal_pending(current))
-				ret = -EINTR;
-			if (timeout && !timeout->task)
-				ret = -ETIMEDOUT;
-			if (ret)
-				break;
-		}
+		if (signal_pending_state(state, current))
+			ret = -EINTR;
+		if (state == TASK_INTERRUPTIBLE && timeout && !timeout->task)
+			ret = -ETIMEDOUT;
+		if (ret)
+			break;
 
 		raw_spin_unlock_irq(&lock->wait_lock);
 
@@ -1469,6 +1462,27 @@ rt_mutex_fastunlock(struct rt_mutex *lock,
 	if (slowfn(lock, &wake_q))
 		rt_mutex_postunlock(&wake_q);
 }
+
+#ifdef CONFIG_MUTEX_PI
+/* Called with lockdep ownership recorded on the outer struct mutex. */
+int __sched rt_mutex_lock_nolockdep(struct rt_mutex *lock, int state)
+{
+	return rt_mutex_fastlock(lock, state, rt_mutex_slowlock);
+}
+
+int __sched rt_mutex_trylock_nolockdep(struct rt_mutex *lock)
+{
+	if (WARN_ON_ONCE(in_irq() || in_nmi() || in_serving_softirq()))
+		return 0;
+
+	return rt_mutex_fasttrylock(lock, rt_mutex_slowtrylock);
+}
+
+void __sched rt_mutex_unlock_nolockdep(struct rt_mutex *lock)
+{
+	rt_mutex_fastunlock(lock, rt_mutex_slowunlock);
+}
+#endif
 
 static inline void __rt_mutex_lock(struct rt_mutex *lock, unsigned int subclass)
 {
