@@ -1503,9 +1503,21 @@ int __sched rt_mutex_trylock_nolockdep(struct rt_mutex *lock)
 	return rt_mutex_fasttrylock(lock, RT_MUTEX_PI_TAG, rt_mutex_slowtrylock);
 }
 
+/* Keep the wake queue and its stack frame out of uncontended unlocks. */
+static noinline void __sched rt_mutex_unlock_pi_slowpath(struct rt_mutex *lock)
+{
+	DEFINE_WAKE_Q(wake_q);
+
+	if (rt_mutex_slowunlock(lock, &wake_q))
+		rt_mutex_postunlock(&wake_q);
+}
+
 void __sched rt_mutex_unlock_nolockdep(struct rt_mutex *lock)
 {
-	rt_mutex_fastunlock(lock, RT_MUTEX_PI_TAG, rt_mutex_slowunlock);
+	if (likely(rt_mutex_cmpxchg_release(lock, current, NULL, RT_MUTEX_PI_TAG)))
+		return;
+
+	rt_mutex_unlock_pi_slowpath(lock);
 }
 #endif
 
