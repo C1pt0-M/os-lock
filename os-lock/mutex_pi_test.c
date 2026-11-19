@@ -20,7 +20,7 @@ static DEFINE_MUTEX_PI(static_lock);
 
 struct trial {
 	enum lock_mode mode;
-	bool interference;
+	bool interference, io_nested, iowait_restored;
 	struct mutex dynamic_lock;
 	struct mutex *mutex;
 	struct rt_mutex rt;
@@ -107,7 +107,14 @@ static int high(void *arg)
 		complete(&s->run_medium);
 	complete(&s->run_low);
 	s->high_start = ktime_get_ns();
-	lock(s);
+	if (s->io_nested) {
+		bool was_iowait = current->in_iowait;
+
+		mutex_lock_io_nested(s->mutex, SINGLE_DEPTH_NESTING);
+		s->iowait_restored = current->in_iowait == was_iowait;
+	} else {
+		lock(s);
+	}
 	s->high_acquired = ktime_get_ns();
 	unlock(s);
 	if (!s->interference)
@@ -116,11 +123,14 @@ static int high(void *arg)
 	return 0;
 }
 
-static int run_trial(int round, enum lock_mode mode, bool interference, int cpu)
+static int run_trial(int round, enum lock_mode mode, bool interference, int cpu,
+		     bool io_nested)
 {
 	static int (* const worker[WORKERS])(void *) = { low, medium, high };
 	struct task_struct *tasks[WORKERS];
-	struct trial s = { .mode = mode, .interference = interference };
+	struct trial s = {
+		.mode = mode, .interference = interference, .io_nested = io_nested,
+	};
 	bool pi = mode == NATIVE_PI ||
 		(IS_ENABLED(CONFIG_MUTEX_PI) && mode != NATIVE);
 	int i, error = 0;
@@ -184,6 +194,13 @@ release:
 		s.restored == s.base && s.boosted == (pi ? s.high_prio : s.base) &&
 		((!interference || pi) ? s.high_acquired <= s.medium_start
 				     : s.medium_end <= s.low_start);
+	if (io_nested) {
+		pass &= s.iowait_restored;
+		pr_info("MPT_IO_NESTED,%s,%d,%d,%d,%d,%s\n", names[mode],
+			s.base, s.boosted, s.restored, s.iowait_restored,
+			pass ? "PASS" : "FAIL");
+		return pass ? 0 : -EINVAL;
+	}
 	pr_info("MPT_RESULT,%d,%s,%d,%d,%llu,%llu,%d,%d,%d,%s\n", round,
 		names[mode], interference, cpu, s.high_acquired - s.high_start,
 		s.pair_ns, s.base, s.boosted, s.restored, pass ? "PASS" : "FAIL");
@@ -405,10 +422,20 @@ static int __init mutex_pi_test_init(void)
 			int slot = (i + round - 1) % (2 * MODES);
 
 			msleep(1000);
-			err = run_trial(round, slot / 2, slot % 2, cpu);
+			err = run_trial(round, slot / 2, slot % 2, cpu, false);
 			if (err)
 				return err;
 		}
+	}
+	if (IS_ENABLED(CONFIG_DEBUG_LOCK_ALLOC)) {
+		msleep(1000);
+		err = run_trial(0, NATIVE, true, cpu, true);
+		if (err)
+			return err;
+		msleep(1000);
+		err = run_trial(0, PI_DYNAMIC, true, cpu, true);
+		if (err)
+			return err;
 	}
 	if (!alloc_cpumask_var(&original, GFP_KERNEL))
 		return -ENOMEM;

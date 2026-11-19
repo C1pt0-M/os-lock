@@ -1213,8 +1213,7 @@ mutex_lock_io_nested(struct mutex *lock, unsigned int subclass)
 	might_sleep();
 
 	token = io_schedule_prepare();
-	__mutex_lock_common(lock, TASK_UNINTERRUPTIBLE,
-			    subclass, NULL, _RET_IP_, NULL, 0);
+	__mutex_lock(lock, TASK_UNINTERRUPTIBLE, subclass, NULL, _RET_IP_);
 	io_schedule_finish(token);
 }
 EXPORT_SYMBOL_GPL(mutex_lock_io_nested);
