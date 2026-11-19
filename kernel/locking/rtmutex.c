@@ -1580,6 +1580,27 @@ int __sched rt_mutex_lock_interruptible(struct rt_mutex *lock)
 }
 EXPORT_SYMBOL_GPL(rt_mutex_lock_interruptible);
 
+/**
+ * rt_mutex_lock_killable - lock an rt_mutex unless a fatal signal arrives
+ * @lock: the rt_mutex to be locked
+ *
+ * Returns 0 on success or -EINTR if the wait was interrupted.
+ */
+int __sched rt_mutex_lock_killable(struct rt_mutex *lock)
+{
+	int ret;
+
+	might_sleep();
+
+	mutex_acquire(&lock->dep_map, 0, 0, _RET_IP_);
+	ret = rt_mutex_fastlock(lock, TASK_KILLABLE, 0, rt_mutex_slowlock);
+	if (ret)
+		mutex_release(&lock->dep_map, _RET_IP_);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rt_mutex_lock_killable);
+
 /*
  * Futex variant, must not use fastpath.
  */
