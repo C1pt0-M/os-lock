@@ -410,14 +410,18 @@ static int signal_waiter(void *arg)
 	return 0;
 }
 
-static int check_signal(int cpu, bool killable)
+static int check_signal(int cpu, bool killable, bool pi, bool cancel)
 {
 	struct signal_trial s = { .killable = killable };
 	struct task_struct *waiter;
-	int base, boosted, after, target_state, sent;
-	bool early = false, done, held, pass;
+	int base, boosted, after, target_state, sent = 0;
+	bool early = false, done, held, clean = true, pass;
+	const char *api = killable ? "killable" : "interruptible";
 
-	mutex_init_pi(&s.lock);
+	if (pi)
+		mutex_init_pi(&s.lock);
+	else
+		mutex_init(&s.lock);
 	init_completion(&s.started);
 	init_completion(&s.done);
 	waiter = make_peer(signal_waiter, &s, cpu, true);
@@ -429,24 +433,49 @@ static int check_signal(int cpu, bool killable)
 	wait_for_completion(&s.started);
 	boosted = READ_ONCE(current->prio);
 	target_state = READ_ONCE(waiter->state);
-	sent = send_sig(SIGUSR1, waiter, 1);
-	if (!sent && killable) {
-		early = wait_for_completion_timeout(&s.done, msecs_to_jiffies(30));
-		if (!early)
-			sent = send_sig(SIGKILL, waiter, 1);
+	if (cancel) {
+		sent = send_sig(SIGUSR1, waiter, 1);
+		if (!sent && killable) {
+			early = wait_for_completion_timeout(&s.done, msecs_to_jiffies(30));
+			if (!early)
+				sent = send_sig(SIGKILL, waiter, 1);
+		}
+		done = !sent && !early && wait_for_completion_timeout(&s.done, HZ);
+		after = READ_ONCE(current->prio);
+		held = mutex_is_locked(&s.lock);
+#ifdef CONFIG_RT_MUTEXES
+		if (done) {
+			unsigned long flags;
+
+			clean = !READ_ONCE(waiter->pi_blocked_on);
+			raw_spin_lock_irqsave(&current->pi_lock, flags);
+			clean &= RB_EMPTY_ROOT(&current->pi_waiters.rb_root);
+			raw_spin_unlock_irqrestore(&current->pi_lock, flags);
+		}
+#endif
+		mutex_unlock(&s.lock);
+	} else {
+		held = mutex_is_locked(&s.lock) && !completion_done(&s.done);
+		mutex_unlock(&s.lock);
+		after = READ_ONCE(current->prio);
+		done = wait_for_completion_timeout(&s.done, HZ);
 	}
-	done = !sent && !early && wait_for_completion_timeout(&s.done, HZ);
-	after = READ_ONCE(current->prio);
-	held = mutex_is_locked(&s.lock);
-	mutex_unlock(&s.lock);
 	join_peer(waiter);
-	pass = done && held && s.ret == -EINTR && after == base &&
+	pass = done && held && clean && s.ret == (cancel ? -EINTR : 0) && after == base &&
 		target_state == (killable ? TASK_KILLABLE : TASK_INTERRUPTIBLE) &&
-		boosted == (IS_ENABLED(CONFIG_MUTEX_PI) ? s.prio : base);
+		boosted == (pi && IS_ENABLED(CONFIG_MUTEX_PI) ? s.prio : base);
+	if (pass && mutex_trylock(&s.lock))
+		mutex_unlock(&s.lock);
+	else
+		pass = false;
+	pass &= !mutex_is_locked(&s.lock);
 	mutex_destroy(&s.lock);
-	pr_info("MPT_SIGNAL,%s,%d,%d,%d,%d,%d,%d,%s\n",
-		killable ? "killable" : "interruptible", base, boosted, after,
-		s.ret, held, early, pass ? "PASS" : "FAIL");
+	if (pi && cancel)
+		pr_info("MPT_SIGNAL,%s,%d,%d,%d,%d,%d,%d,%s\n", api, base,
+			boosted, after, s.ret, held, early, pass ? "PASS" : "FAIL");
+	else
+		pr_info("MPT_SIGNAL_EXTRA,%d,%d,%s,%d,%d,%d,%d,%s\n", pi, cancel,
+			api, base, boosted, after, s.ret, pass ? "PASS" : "FAIL");
 	return pass ? 0 : -EINVAL;
 }
 
@@ -490,6 +519,38 @@ static void check_uncontended_cost(void)
 	rt_mutex_destroy(&s.rt);
 }
 
+static int check_signal_cost(void)
+{
+	struct mutex locks[2];
+	int batch, mode, i, ret;
+
+	mutex_init(&locks[0]);
+	mutex_init_pi(&locks[1]);
+	for (batch = 0; batch < COST_BATCHES; batch++) {
+		for (mode = 0; mode < 4; mode++) {
+			int slot = (batch + mode) % 4;
+			struct mutex *lock = &locks[slot / 2];
+			unsigned long switches = current->nvcsw + current->nivcsw;
+			u64 start = ktime_get_ns(), elapsed;
+
+			for (i = 0; i < PAIRS; i++) {
+				ret = (slot % 2) ? mutex_lock_killable(lock) :
+					mutex_lock_interruptible(lock);
+				if (ret)
+					return ret;
+				mutex_unlock(lock);
+			}
+			elapsed = ktime_get_ns() - start;
+			pr_info("MPT_SIGNAL_COST,%d,%d,%d,%d,%llu,%lu\n", batch + 1,
+				slot / 2, slot % 2, PAIRS, elapsed,
+				current->nvcsw + current->nivcsw - switches);
+		}
+	}
+	mutex_destroy(&locks[0]);
+	mutex_destroy(&locks[1]);
+	return 0;
+}
+
 static int __init mutex_pi_test_init(void)
 {
 	int round, i, err;
@@ -524,10 +585,8 @@ static int __init mutex_pi_test_init(void)
 	err = set_cpus_allowed_ptr(current, cpumask_of(cpu));
 	if (!err) {
 		err = check_chain(cpu);
-		if (!err)
-			err = check_signal(cpu, false);
-		if (!err)
-			err = check_signal(cpu, true);
+		for (i = 0; i < 8 && !err; i++)
+			err = check_signal(cpu, i & 1, i & 2, !(i & 4));
 #ifdef CONFIG_SMP
 		if (!err && num_online_cpus() > 1) {
 			int remote = cpumask_next(cpu, cpu_online_mask);
@@ -541,6 +600,8 @@ static int __init mutex_pi_test_init(void)
 #endif
 		if (!err)
 			check_uncontended_cost();
+		if (!err)
+			err = check_signal_cost();
 		set_cpus_allowed_ptr(current, original);
 	}
 	free_cpumask_var(original);

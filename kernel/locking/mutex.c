@@ -1378,7 +1378,13 @@ int __sched mutex_lock_interruptible(struct mutex *lock)
 {
 	might_sleep();
 
+#if defined(CONFIG_MUTEX_PI) && !defined(CONFIG_DEBUG_MUTEXES)
+	if (mutex_uses_pi(lock))
+		return rt_mutex_lock_nolockdep(&lock->pi_lock, TASK_INTERRUPTIBLE);
+	if (__mutex_trylock_fast(lock))
+#else
 	if (!mutex_uses_pi(lock) && __mutex_trylock_fast(lock))
+#endif
 		return 0;
 
 	return __mutex_lock_interruptible_slowpath(lock);
@@ -1402,7 +1408,13 @@ int __sched mutex_lock_killable(struct mutex *lock)
 {
 	might_sleep();
 
+#if defined(CONFIG_MUTEX_PI) && !defined(CONFIG_DEBUG_MUTEXES)
+	if (mutex_uses_pi(lock))
+		return rt_mutex_lock_nolockdep(&lock->pi_lock, TASK_KILLABLE);
+	if (__mutex_trylock_fast(lock))
+#else
 	if (!mutex_uses_pi(lock) && __mutex_trylock_fast(lock))
+#endif
 		return 0;
 
 	return __mutex_lock_killable_slowpath(lock);
