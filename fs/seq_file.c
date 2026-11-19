@@ -66,7 +66,7 @@ int seq_open(struct file *file, const struct seq_operations *op)
 
 	file->private_data = p;
 
-	mutex_init(&p->lock);
+	mutex_init_pi(&p->lock);
 	p->op = op;
 
 	// No refcounting: the lifetime of 'p' is constrained
