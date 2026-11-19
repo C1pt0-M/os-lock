@@ -323,7 +323,15 @@ void __sched mutex_lock(struct mutex *lock)
 {
 	might_sleep();
 
+#if defined(CONFIG_MUTEX_PI) && !defined(CONFIG_DEBUG_MUTEXES)
+	if (mutex_uses_pi(lock)) {
+		rt_mutex_lock_nolockdep(&lock->pi_lock, TASK_UNINTERRUPTIBLE);
+		return;
+	}
+	if (!__mutex_trylock_fast(lock))
+#else
 	if (mutex_uses_pi(lock) || !__mutex_trylock_fast(lock))
+#endif
 		__mutex_lock_slowpath(lock);
 }
 EXPORT_SYMBOL(mutex_lock);
