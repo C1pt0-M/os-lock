@@ -20,7 +20,7 @@ static DEFINE_MUTEX_PI(static_lock);
 
 struct trial {
 	enum lock_mode mode;
-	bool interference, io_nested, iowait_restored;
+	bool interference, io_nested, iowait_restored, recursive_busy;
 	struct mutex dynamic_lock;
 	struct mutex *mutex;
 	struct rt_mutex rt;
@@ -102,6 +102,8 @@ static int high(void *arg)
 	s->high_prio = READ_ONCE(current->prio);
 	complete(&s->ready_h);
 	wait_for_completion(&s->held);
+	if (s->mode != NATIVE_PI)
+		s->recursive_busy = mutex_trylock_recursive(s->mutex) == MUTEX_TRYLOCK_FAILED;
 	/* The lower-priority workers share H's CPU and cannot preempt it. */
 	if (s->interference)
 		complete(&s->run_medium);
@@ -151,6 +153,12 @@ static int run_trial(int round, enum lock_mode mode, bool interference, int cpu,
 		mutex_unlock(s.mutex);
 		if (!pass || mutex_is_locked(s.mutex))
 			return -EINVAL;
+		if (mutex_trylock_recursive(s.mutex) != MUTEX_TRYLOCK_SUCCESS)
+			return -EINVAL;
+		pass = mutex_trylock_recursive(s.mutex) == MUTEX_TRYLOCK_RECURSIVE;
+		mutex_unlock(s.mutex);
+		if (!pass || mutex_is_locked(s.mutex))
+			return -EINVAL;
 	}
 	init_completion(&s.held);
 	init_completion(&s.run_low);
@@ -190,6 +198,7 @@ release:
 	pass = s.high_start && s.high_start <= s.low_start &&
 		s.high_start <= s.medium_start && s.low_start <= s.low_unlock &&
 		s.low_unlock <= s.high_acquired && s.medium_start <= s.medium_end &&
+		(mode == NATIVE_PI || s.recursive_busy) &&
 		s.high_prio < s.medium_prio && s.medium_prio < s.base &&
 		s.restored == s.base && s.boosted == (pi ? s.high_prio : s.base) &&
 		((!interference || pi) ? s.high_acquired <= s.medium_start
@@ -305,6 +314,78 @@ static int check_chain(int cpu)
 		s.middle_boost, s.middle_after, s.high_prio, pass ? "PASS" : "FAIL");
 	return pass ? 0 : -EINVAL;
 }
+
+#ifdef CONFIG_SMP
+struct cross_cpu_trial {
+	struct mutex lock;
+	struct completion started, acquired;
+	int waiter_cpu, waiter_prio;
+};
+
+static int cross_cpu_waiter(void *arg)
+{
+	struct cross_cpu_trial *s = arg;
+
+	s->waiter_cpu = task_cpu(current);
+	s->waiter_prio = READ_ONCE(current->prio);
+	complete(&s->started);
+	mutex_lock(&s->lock);
+	complete(&s->acquired);
+	mutex_unlock(&s->lock);
+	return 0;
+}
+
+static int check_cross_cpu(int cpu, int remote, int round, bool pi)
+{
+	struct cross_cpu_trial s = { .waiter_cpu = -1 };
+	struct task_struct *waiter;
+	unsigned long deadline;
+	int owner_cpu, before, held, after;
+	bool blocked = false, pass;
+
+	if (pi)
+		mutex_init_pi(&s.lock);
+	else
+		mutex_init(&s.lock);
+	init_completion(&s.started);
+	init_completion(&s.acquired);
+	waiter = make_peer(cross_cpu_waiter, &s, remote, true);
+	if (IS_ERR(waiter)) {
+		mutex_destroy(&s.lock);
+		return PTR_ERR(waiter);
+	}
+
+	mutex_lock(&s.lock);
+	owner_cpu = task_cpu(current);
+	before = READ_ONCE(current->prio);
+	wake_up_process(waiter);
+	if (wait_for_completion_timeout(&s.started, HZ)) {
+		deadline = jiffies + HZ;
+		do {
+			/* on_cpu is cleared with release semantics at switch-out. */
+			if (READ_ONCE(waiter->state) == TASK_UNINTERRUPTIBLE &&
+			    !smp_load_acquire(&waiter->on_cpu)) {
+				blocked = !completion_done(&s.acquired);
+				break;
+			}
+			usleep_range(100, 200);
+		} while (time_before(jiffies, deadline));
+	}
+	held = READ_ONCE(current->prio);
+	mutex_unlock(&s.lock);
+	after = READ_ONCE(current->prio);
+	join_peer(waiter);
+	mutex_destroy(&s.lock);
+	pass = blocked && owner_cpu == cpu && s.waiter_cpu == remote &&
+		cpu != remote && s.waiter_prio < before &&
+		held == (pi && IS_ENABLED(CONFIG_MUTEX_PI) ? s.waiter_prio : before) &&
+		after == before && completion_done(&s.acquired);
+	pr_info("MPT_CROSS_CPU,%d,%s,%d,%d,%d,%d,%d,%d,%s\n", round,
+		pi ? "pi" : "ordinary", owner_cpu, s.waiter_cpu, before, held,
+		after, s.waiter_prio, pass ? "PASS" : "FAIL");
+	return pass ? 0 : -EINVAL;
+}
+#endif
 
 struct signal_trial {
 	struct mutex lock;
@@ -447,6 +528,17 @@ static int __init mutex_pi_test_init(void)
 			err = check_signal(cpu, false);
 		if (!err)
 			err = check_signal(cpu, true);
+#ifdef CONFIG_SMP
+		if (!err && num_online_cpus() > 1) {
+			int remote = cpumask_next(cpu, cpu_online_mask);
+
+			for (round = 1; round <= 12 && !err; round++) {
+				err = check_cross_cpu(cpu, remote, round, false);
+				if (!err)
+					err = check_cross_cpu(cpu, remote, round, true);
+			}
+		}
+#endif
 		if (!err)
 			check_uncontended_cost();
 		set_cpus_allowed_ptr(current, original);

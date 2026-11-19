@@ -353,6 +353,45 @@ static struct lock_torture_ops mutex_lock_ops = {
 	.name		= "mutex_lock"
 };
 
+#ifdef CONFIG_MUTEX_PI
+static struct mutex torture_pi_mutex;
+torture_param(bool, pi_mix, false, "Pin mutex_pi_lock writers with mixed policies");
+torture_param(bool, pi_mix_paced, false, "Pace normal-policy writers as well as FIFO writers");
+
+static void torture_pi_mutex_init(void)
+{
+	mutex_init_pi(&torture_pi_mutex);
+}
+
+static int torture_pi_mutex_lock(void) __acquires(torture_pi_mutex)
+{
+	mutex_lock(&torture_pi_mutex);
+	return 0;
+}
+
+static void torture_pi_mutex_unlock(void) __releases(torture_pi_mutex)
+{
+	mutex_unlock(&torture_pi_mutex);
+}
+
+static void torture_pi_mutex_delay(struct torture_random_state *trsp)
+{
+	if (pi_mix)
+		udelay(100);
+	else
+		torture_mutex_delay(trsp);
+}
+
+static struct lock_torture_ops mutex_pi_lock_ops = {
+	.init		= torture_pi_mutex_init,
+	.writelock	= torture_pi_mutex_lock,
+	.write_delay	= torture_pi_mutex_delay,
+	.task_boost	= torture_boost_dummy,
+	.writeunlock	= torture_pi_mutex_unlock,
+	.name		= "mutex_pi_lock",
+};
+#endif
+
 #include <linux/ww_mutex.h>
 static DEFINE_WD_CLASS(torture_ww_class);
 static DEFINE_WW_MUTEX(torture_ww_mutex_0, &torture_ww_class);
@@ -616,8 +655,33 @@ static int lock_torture_writer(void *arg)
 
 	VERBOSE_TOROUT_STRING("lock_torture_writer task started");
 	set_user_nice(current, MAX_NICE);
+#ifdef CONFIG_MUTEX_PI
+	if (pi_mix) {
+		int id = lwsp - cxt.lwsa;
+		unsigned int cpu = cpumask_local_spread(id, NUMA_NO_NODE);
+		int group = id / num_online_cpus() % 4;
+
+		if (WARN_ON_ONCE(set_cpus_allowed_ptr(current, cpumask_of(cpu)))) {
+			lwsp->n_lock_fail++;
+			goto stopping;
+		}
+		if (group == 0)
+			sched_set_fifo(current);
+		else if (group == 1)
+			sched_set_fifo_low(current);
+		else
+			sched_set_normal(current, group == 2 ? 0 : 10);
+		pr_info("PI_TORTURE_WRITER,%d,%u,%d,%d\n", id, cpu,
+			current->policy, current->normal_prio);
+	}
+#endif
 
 	do {
+#ifdef CONFIG_MUTEX_PI
+		/* Leave capacity for the normal-policy writers and guest tasks. */
+		if (pi_mix && (current->policy == SCHED_FIFO || pi_mix_paced))
+			schedule_timeout_uninterruptible(msecs_to_jiffies(5));
+#endif
 		if ((torture_random(&rand) & 0xfffff) == 0)
 			schedule_timeout_uninterruptible(1);
 
@@ -638,6 +702,11 @@ static int lock_torture_writer(void *arg)
 	} while (!torture_must_stop());
 
 	cxt.cur_ops->task_boost(NULL); /* reset prio */
+#ifdef CONFIG_MUTEX_PI
+	if (pi_mix)
+		sched_set_normal(current, 0);
+stopping:
+#endif
 	torture_kthread_stopping("lock_torture_writer");
 	return 0;
 }
@@ -840,6 +909,9 @@ static int __init lock_torture_init(void)
 		&spin_lock_ops, &spin_lock_irq_ops,
 		&rw_lock_ops, &rw_lock_irq_ops,
 		&mutex_lock_ops,
+#ifdef CONFIG_MUTEX_PI
+		&mutex_pi_lock_ops,
+#endif
 		&ww_mutex_lock_ops,
 #ifdef CONFIG_RT_MUTEXES
 		&rtmutex_lock_ops,
@@ -874,6 +946,13 @@ static int __init lock_torture_init(void)
 		goto unwind;
 	}
 
+#ifdef CONFIG_MUTEX_PI
+	if (pi_mix && (cxt.cur_ops != &mutex_pi_lock_ops || shuffle_interval || onoff_interval)) {
+		pr_err("pi_mix requires mutex_pi_lock with shuffling and hotplug disabled\n");
+		firsterr = -EINVAL;
+		goto unwind;
+	}
+#endif
 	if (cxt.cur_ops->init)
 		cxt.cur_ops->init();
 
