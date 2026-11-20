@@ -56,15 +56,27 @@ static inline unsigned long rt_mutex_owner_tag(struct rt_mutex *lock)
 	return (unsigned long)READ_ONCE(lock->owner) & RT_MUTEX_PI_TAG;
 }
 
-static void
-rt_mutex_set_owner(struct rt_mutex *lock, struct task_struct *owner)
+static inline struct task_struct *
+rt_mutex_owner_encode(struct rt_mutex *lock, struct task_struct *owner)
 {
 	unsigned long val = (unsigned long)owner | rt_mutex_owner_tag(lock);
 
 	if (rt_mutex_has_waiters(lock))
 		val |= RT_MUTEX_HAS_WAITERS;
 
-	WRITE_ONCE(lock->owner, (struct task_struct *)val);
+	return (struct task_struct *)val;
+}
+
+static inline void
+rt_mutex_set_owner(struct rt_mutex *lock, struct task_struct *owner)
+{
+	/* The previous owner may have released without taking wait_lock. */
+	xchg_acquire(&lock->owner, rt_mutex_owner_encode(lock, owner));
+}
+
+static inline void rt_mutex_clear_owner(struct rt_mutex *lock)
+{
+	WRITE_ONCE(lock->owner, rt_mutex_owner_encode(lock, NULL));
 }
 
 static inline void clear_rt_mutex_waiters(struct rt_mutex *lock)
@@ -73,7 +85,7 @@ static inline void clear_rt_mutex_waiters(struct rt_mutex *lock)
 			((unsigned long)lock->owner & ~RT_MUTEX_HAS_WAITERS);
 }
 
-static void fixup_rt_mutex_waiters(struct rt_mutex *lock)
+static void fixup_rt_mutex_waiters(struct rt_mutex *lock, bool acquire_lock)
 {
 	unsigned long owner, *p = (unsigned long *) &lock->owner;
 
@@ -139,8 +151,12 @@ static void fixup_rt_mutex_waiters(struct rt_mutex *lock)
 	 * still set.
 	 */
 	owner = READ_ONCE(*p);
-	if (owner & RT_MUTEX_HAS_WAITERS)
-		WRITE_ONCE(*p, owner & ~RT_MUTEX_HAS_WAITERS);
+	if (owner & RT_MUTEX_HAS_WAITERS) {
+		if (acquire_lock)
+			xchg_acquire(p, owner & ~RT_MUTEX_HAS_WAITERS);
+		else
+			WRITE_ONCE(*p, owner & ~RT_MUTEX_HAS_WAITERS);
+	}
 }
 
 /*
@@ -181,6 +197,9 @@ static inline void mark_rt_mutex_waiters(struct rt_mutex *lock)
 		owner = *p;
 	} while (cmpxchg_relaxed(p, owner,
 				 owner | RT_MUTEX_HAS_WAITERS) != owner);
+
+	/* Order the successful waiter-bit RMW, not each failed attempt. */
+	smp_mb__after_atomic();
 }
 
 /*
@@ -242,7 +261,7 @@ static inline bool unlock_rt_mutex_safe(struct rt_mutex *lock,
 					unsigned long flags)
 	__releases(lock->wait_lock)
 {
-	rt_mutex_set_owner(lock, NULL);
+	rt_mutex_clear_owner(lock);
 	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
 	return true;
 }
@@ -1299,7 +1318,7 @@ rt_mutex_slowlock(struct rt_mutex *lock, int state,
 	 * try_to_take_rt_mutex() sets the waiter bit
 	 * unconditionally. We might have to fix that up.
 	 */
-	fixup_rt_mutex_waiters(lock);
+	fixup_rt_mutex_waiters(lock, true);
 
 	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
 
@@ -1320,7 +1339,7 @@ static inline int __rt_mutex_slowtrylock(struct rt_mutex *lock)
 	 * try_to_take_rt_mutex() sets the lock waiters bit
 	 * unconditionally. Clean this up.
 	 */
-	fixup_rt_mutex_waiters(lock);
+	fixup_rt_mutex_waiters(lock, true);
 
 	return ret;
 }
@@ -1778,7 +1797,7 @@ void rt_mutex_init_proxy_locked(struct rt_mutex *lock,
 void rt_mutex_proxy_unlock(struct rt_mutex *lock)
 {
 	debug_rt_mutex_proxy_unlock(lock);
-	rt_mutex_set_owner(lock, NULL);
+	rt_mutex_clear_owner(lock);
 }
 
 /**
@@ -1915,7 +1934,7 @@ int rt_mutex_wait_proxy_lock(struct rt_mutex *lock,
 	 * try_to_take_rt_mutex() sets the waiter bit unconditionally. We might
 	 * have to fix that up.
 	 */
-	fixup_rt_mutex_waiters(lock);
+	fixup_rt_mutex_waiters(lock, true);
 	raw_spin_unlock_irq(&lock->wait_lock);
 
 	return ret;
@@ -1971,7 +1990,7 @@ bool rt_mutex_cleanup_proxy_lock(struct rt_mutex *lock,
 	 * try_to_take_rt_mutex() sets the waiter bit unconditionally. We might
 	 * have to fix that up.
 	 */
-	fixup_rt_mutex_waiters(lock);
+	fixup_rt_mutex_waiters(lock, false);
 
 	raw_spin_unlock_irq(&lock->wait_lock);
 
