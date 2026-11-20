@@ -459,12 +459,21 @@ static int check_pi_gate(int cpu, bool write, int state, const char *name)
 {
 	struct rw_semaphore sem;
 	struct peer h = { .sem = &sem, .write = write, .fifo = true, .state = state };
+	struct peer m = { .state = TASK_UNINTERRUPTIBLE, .medium = true };
 	bool cancel = state != TASK_UNINTERRUPTIBLE;
 	bool blocked, pass, ignored_usr1 = false, clean = false;
 	unsigned long flags;
 	int base, held, after;
 	u64 release;
 
+	if (!cancel) {
+		if (start_peer(&m, task_cpu(current)))
+			return -ENOMEM;
+		if (!wait_for_completion_timeout(&m.started, WAIT_TIME)) {
+			stop_peer(&m);
+			return -ETIMEDOUT;
+		}
+	}
 	init_rwsem_pi(&sem);
 	down_write(&sem);
 	base = READ_ONCE(current->prio);
@@ -486,19 +495,27 @@ static int check_pi_gate(int cpu, bool write, int state, const char *name)
 		       atomic_read(&sem.pi.readers) == RWSEM_PI_WRITER_BIAS &&
 		       gate_owner(&sem) == current && READ_ONCE(current->prio) == base;
 	}
+	if (pass && !cancel) {
+		complete(&m.release);
+		busy_ns(2000000);
+	}
 	release = ktime_get_ns();
 	up_write(&sem);
 	after = READ_ONCE(current->prio);
 	if (!cancel)
 		pass = pass && wait_for_completion_timeout(&h.finished, WAIT_TIME) &&
-		       h.acquire_ns >= release && !h.ret;
+		       wait_for_completion_timeout(&m.finished, WAIT_TIME) &&
+		       h.acquire_ns >= release && !h.ret && h.prio < m.prio &&
+		       m.prio < base && m.cpu == task_cpu(current) && m.request_ns >= release;
 	stop_peer(&h);
+	stop_peer(&m);
 	pass = pass && held == h.prio && held < base && after == base &&
 	       atomic_read(&sem.pi.readers) == RWSEM_PI_READER_BIAS &&
 	       !rt_mutex_is_locked(&sem.pi.gate);
-	pr_info("RWT_PI_GATE,%s,cpus=%d/%d,H=%d,L=%d/%d/%d,blocked=%d,ret=%d,ignored_usr1=%d,clean=%d,%s\n",
+	pr_info("RWT_PI_GATE,%s,cpus=%d/%d,H=%d,L=%d/%d/%d,blocked=%d,ret=%d,ignored_usr1=%d,clean=%d,M=%d,M_after_release=%d,%s\n",
 		name, task_cpu(current), h.cpu, h.prio, base, held, after, blocked,
-		h.ret, ignored_usr1, clean, pass ? "PASS" : "FAIL");
+		h.ret, ignored_usr1, clean, m.prio, !cancel && m.request_ns >= release,
+		pass ? "PASS" : "FAIL");
 	return pass ? 0 : -EINVAL;
 }
 
