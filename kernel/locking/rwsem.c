@@ -29,6 +29,9 @@
 #include <linux/atomic.h>
 
 #include "lock_events.h"
+#ifdef CONFIG_RWSEM_PI
+#include "rtmutex_common.h"
+#endif
 
 /*
  * The least significant 3 bits of the owner value has the following
@@ -1332,11 +1335,191 @@ static struct rw_semaphore *rwsem_downgrade_wake(struct rw_semaphore *sem)
 	return sem;
 }
 
+#ifdef CONFIG_RWSEM_PI
+static_assert(offsetof(struct rw_semaphore, owner) ==
+	      offsetof(struct rw_semaphore, pi.gate.owner));
+static_assert(sizeof_field(struct rw_semaphore, owner) ==
+	      sizeof_field(struct rt_mutex, owner));
+static_assert(!(RWSEM_OWNER_FLAGS_MASK & RT_MUTEX_PI_TAG));
+static_assert(L1_CACHE_BYTES >= 2 * RT_MUTEX_PI_TAG);
+
+void __init_rwsem_pi(struct rw_semaphore *sem, const char *name,
+		   struct lock_class_key *key)
+{
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	debug_check_no_locks_freed(sem, sizeof(*sem));
+	lockdep_init_map_wait(&sem->dep_map, name, key, 0, LD_WAIT_SLEEP);
+#endif
+#ifdef CONFIG_DEBUG_RWSEMS
+	sem->magic = sem;
+#endif
+	atomic_set(&sem->pi.readers, RWSEM_PI_READER_BIAS);
+	__rt_mutex_init(&sem->pi.gate, name, key);
+	sem->pi.gate.owner = (struct task_struct *)RT_MUTEX_PI_TAG;
+}
+EXPORT_SYMBOL(__init_rwsem_pi);
+
+/* Based on rwbase_rt: gate owners can inherit, draining readers cannot. */
+static inline void rwsem_pi_check_magic(struct rw_semaphore *sem)
+{
+#ifdef CONFIG_DEBUG_RWSEMS
+	DEBUG_LOCKS_WARN_ON(sem->magic != sem);
+#endif
+}
+
+static inline bool rwsem_pi_read_trylock(struct rw_semaphore *sem)
+{
+	int count = atomic_read(&sem->pi.readers);
+
+	rwsem_pi_check_magic(sem);
+	while (count < 0) {
+		if (likely(atomic_try_cmpxchg_acquire(&sem->pi.readers, &count,
+						     count + 1)))
+			return true;
+	}
+	return false;
+}
+
+static noinline int __sched rwsem_pi_read_slowlock(struct rw_semaphore *sem,
+						   int state)
+{
+	struct rt_mutex *gate = &sem->pi.gate;
+	int ret;
+
+	raw_spin_lock_irq(&gate->wait_lock);
+	ret = rt_mutex_lock_locked_nolockdep(gate, state);
+	if (!ret)
+		atomic_inc(&sem->pi.readers);
+	raw_spin_unlock_irq(&gate->wait_lock);
+	if (!ret)
+		rt_mutex_unlock_nolockdep(gate);
+	return ret;
+}
+
+static int __sched rwsem_pi_read_lock(struct rw_semaphore *sem, int state)
+{
+	if (likely(rwsem_pi_read_trylock(sem)))
+		return 0;
+	return rwsem_pi_read_slowlock(sem, state);
+}
+
+static noinline void rwsem_pi_wake_writer(struct rw_semaphore *sem)
+{
+	struct rt_mutex *gate = &sem->pi.gate;
+	unsigned long flags;
+	DEFINE_WAKE_Q(wake_q);
+
+	raw_spin_lock_irqsave(&gate->wait_lock, flags);
+	/* A writer may have already finished the drain or rolled it back. */
+	if (!atomic_read(&sem->pi.readers))
+		wake_q_add(&wake_q, rt_mutex_owner(gate));
+	raw_spin_unlock_irqrestore(&gate->wait_lock, flags);
+	wake_up_q(&wake_q);
+}
+
+static inline void rwsem_pi_read_unlock(struct rw_semaphore *sem)
+{
+	rwsem_pi_check_magic(sem);
+	/* Publish this reader's critical section, including the last exit. */
+	if (unlikely(atomic_dec_and_test(&sem->pi.readers)))
+		rwsem_pi_wake_writer(sem);
+}
+
+static bool rwsem_pi_finish_drain(struct rw_semaphore *sem)
+{
+	if (atomic_read_acquire(&sem->pi.readers))
+		return false;
+	atomic_set(&sem->pi.readers, RWSEM_PI_WRITER_BIAS);
+	return true;
+}
+
+static void rwsem_pi_reopen(struct rw_semaphore *sem, int delta)
+{
+	/* Preserve concurrent reader exits; publish to fast-path readers. */
+	atomic_add_return_release(delta, &sem->pi.readers);
+}
+
+static int __sched rwsem_pi_write_lock(struct rw_semaphore *sem, int state)
+{
+	struct rt_mutex *gate = &sem->pi.gate;
+	int ret;
+
+	rwsem_pi_check_magic(sem);
+	ret = rt_mutex_lock_nolockdep(gate, state);
+	if (ret)
+		return ret;
+
+	raw_spin_lock_irq(&gate->wait_lock);
+	(void)atomic_sub_return(RWSEM_PI_READER_BIAS, &sem->pi.readers);
+	for (;;) {
+		set_current_state(state);
+		if (rwsem_pi_finish_drain(sem)) {
+			__set_current_state(TASK_RUNNING);
+			raw_spin_unlock_irq(&gate->wait_lock);
+			return 0;
+		}
+		if (signal_pending_state(state, current))
+			break;
+		raw_spin_unlock_irq(&gate->wait_lock);
+		schedule();
+		raw_spin_lock_irq(&gate->wait_lock);
+	}
+	__set_current_state(TASK_RUNNING);
+	rwsem_pi_reopen(sem, RWSEM_PI_READER_BIAS);
+	raw_spin_unlock_irq(&gate->wait_lock);
+	rt_mutex_unlock_nolockdep(gate);
+	return -EINTR;
+}
+
+static bool rwsem_pi_write_trylock(struct rw_semaphore *sem)
+{
+	struct rt_mutex *gate = &sem->pi.gate;
+	unsigned long flags;
+	bool locked;
+
+	rwsem_pi_check_magic(sem);
+	if (!rt_mutex_trylock_nolockdep(gate))
+		return false;
+	raw_spin_lock_irqsave(&gate->wait_lock, flags);
+	(void)atomic_sub_return(RWSEM_PI_READER_BIAS, &sem->pi.readers);
+	locked = rwsem_pi_finish_drain(sem);
+	if (!locked)
+		rwsem_pi_reopen(sem, RWSEM_PI_READER_BIAS);
+	raw_spin_unlock_irqrestore(&gate->wait_lock, flags);
+	if (!locked)
+		rt_mutex_unlock_nolockdep(gate);
+	return locked;
+}
+
+static void rwsem_pi_write_release(struct rw_semaphore *sem, bool downgrade)
+{
+	struct rt_mutex *gate = &sem->pi.gate;
+	unsigned long flags;
+	int delta = (int)((unsigned int)RWSEM_PI_READER_BIAS -
+			  RWSEM_PI_WRITER_BIAS + downgrade);
+
+	rwsem_pi_check_magic(sem);
+#ifdef CONFIG_DEBUG_RWSEMS
+	DEBUG_LOCKS_WARN_ON(rt_mutex_owner(gate) != current);
+#endif
+	raw_spin_lock_irqsave(&gate->wait_lock, flags);
+	rwsem_pi_reopen(sem, delta);
+	raw_spin_unlock_irqrestore(&gate->wait_lock, flags);
+	rt_mutex_unlock_nolockdep(gate);
+}
+#endif /* CONFIG_RWSEM_PI */
+
 /*
  * lock for reading
  */
 static inline void __down_read(struct rw_semaphore *sem)
 {
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem)) {
+		rwsem_pi_read_lock(sem, TASK_UNINTERRUPTIBLE);
+		return;
+	}
+#endif
 	if (!rwsem_read_trylock(sem)) {
 		rwsem_down_read_slowpath(sem, TASK_UNINTERRUPTIBLE);
 		DEBUG_RWSEMS_WARN_ON(!is_rwsem_reader_owned(sem), sem);
@@ -1347,6 +1530,10 @@ static inline void __down_read(struct rw_semaphore *sem)
 
 static inline int __down_read_interruptible(struct rw_semaphore *sem)
 {
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem))
+		return rwsem_pi_read_lock(sem, TASK_INTERRUPTIBLE);
+#endif
 	if (!rwsem_read_trylock(sem)) {
 		if (IS_ERR(rwsem_down_read_slowpath(sem, TASK_INTERRUPTIBLE)))
 			return -EINTR;
@@ -1359,6 +1546,10 @@ static inline int __down_read_interruptible(struct rw_semaphore *sem)
 
 static inline int __down_read_killable(struct rw_semaphore *sem)
 {
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem))
+		return rwsem_pi_read_lock(sem, TASK_KILLABLE);
+#endif
 	if (!rwsem_read_trylock(sem)) {
 		if (IS_ERR(rwsem_down_read_slowpath(sem, TASK_KILLABLE)))
 			return -EINTR;
@@ -1373,6 +1564,10 @@ static inline int __down_read_trylock(struct rw_semaphore *sem)
 {
 	long tmp;
 
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem))
+		return rwsem_pi_read_trylock(sem);
+#endif
 	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
 
 	/*
@@ -1396,6 +1591,12 @@ static inline void __down_write(struct rw_semaphore *sem)
 {
 	long tmp = RWSEM_UNLOCKED_VALUE;
 
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem)) {
+		rwsem_pi_write_lock(sem, TASK_UNINTERRUPTIBLE);
+		return;
+	}
+#endif
 	if (unlikely(!atomic_long_try_cmpxchg_acquire(&sem->count, &tmp,
 						      RWSEM_WRITER_LOCKED)))
 		rwsem_down_write_slowpath(sem, TASK_UNINTERRUPTIBLE);
@@ -1407,6 +1608,10 @@ static inline int __down_write_killable(struct rw_semaphore *sem)
 {
 	long tmp = RWSEM_UNLOCKED_VALUE;
 
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem))
+		return rwsem_pi_write_lock(sem, TASK_KILLABLE);
+#endif
 	if (unlikely(!atomic_long_try_cmpxchg_acquire(&sem->count, &tmp,
 						      RWSEM_WRITER_LOCKED))) {
 		if (IS_ERR(rwsem_down_write_slowpath(sem, TASK_KILLABLE)))
@@ -1421,6 +1626,10 @@ static inline int __down_write_trylock(struct rw_semaphore *sem)
 {
 	long tmp;
 
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem))
+		return rwsem_pi_write_trylock(sem);
+#endif
 	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
 
 	tmp  = RWSEM_UNLOCKED_VALUE;
@@ -1439,6 +1648,12 @@ static inline void __up_read(struct rw_semaphore *sem)
 {
 	long tmp;
 
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem)) {
+		rwsem_pi_read_unlock(sem);
+		return;
+	}
+#endif
 	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
 	DEBUG_RWSEMS_WARN_ON(!is_rwsem_reader_owned(sem), sem);
 
@@ -1459,6 +1674,12 @@ static inline void __up_write(struct rw_semaphore *sem)
 {
 	long tmp;
 
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem)) {
+		rwsem_pi_write_release(sem, false);
+		return;
+	}
+#endif
 	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
 	/*
 	 * sem->owner may differ from current if the ownership is transferred
@@ -1480,6 +1701,12 @@ static inline void __downgrade_write(struct rw_semaphore *sem)
 {
 	long tmp;
 
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem)) {
+		rwsem_pi_write_release(sem, true);
+		return;
+	}
+#endif
 	/*
 	 * When downgrading from exclusive to shared ownership,
 	 * anything inside the write-locked region cannot leak
@@ -1653,14 +1880,6 @@ void _down_write_nest_lock(struct rw_semaphore *sem, struct lockdep_map *nest)
 }
 EXPORT_SYMBOL(_down_write_nest_lock);
 
-void down_read_non_owner(struct rw_semaphore *sem)
-{
-	might_sleep();
-	__down_read(sem);
-	__rwsem_set_reader_owned(sem, NULL);
-}
-EXPORT_SYMBOL(down_read_non_owner);
-
 void down_write_nested(struct rw_semaphore *sem, int subclass)
 {
 	might_sleep();
@@ -1684,11 +1903,33 @@ int __sched down_write_killable_nested(struct rw_semaphore *sem, int subclass)
 }
 EXPORT_SYMBOL(down_write_killable_nested);
 
+#endif /* CONFIG_DEBUG_LOCK_ALLOC */
+
+#if defined(CONFIG_DEBUG_LOCK_ALLOC) || defined(CONFIG_RWSEM_PI)
+void down_read_non_owner(struct rw_semaphore *sem)
+{
+	if (WARN_ON_ONCE(rwsem_uses_pi(sem)))
+		return;
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	might_sleep();
+	__down_read(sem);
+	__rwsem_set_reader_owned(sem, NULL);
+#else
+	down_read(sem);
+#endif
+}
+EXPORT_SYMBOL(down_read_non_owner);
+
 void up_read_non_owner(struct rw_semaphore *sem)
 {
+	if (WARN_ON_ONCE(rwsem_uses_pi(sem)))
+		return;
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
 	DEBUG_RWSEMS_WARN_ON(!is_rwsem_reader_owned(sem), sem);
 	__up_read(sem);
+#else
+	up_read(sem);
+#endif
 }
 EXPORT_SYMBOL(up_read_non_owner);
-
 #endif

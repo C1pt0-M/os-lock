@@ -17,6 +17,11 @@
 #include <linux/atomic.h>
 #include <linux/err.h>
 #include <linux/cleanup.h>
+#ifdef CONFIG_RWSEM_PI
+#include <linux/rtmutex.h>
+#define RWSEM_PI_READER_BIAS	(-2147483647 - 1)
+#define RWSEM_PI_WRITER_BIAS	(1 << 30)
+#endif
 
 #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
 #include <linux/osq_lock.h>
@@ -35,6 +40,10 @@
  * cacheline bouncing problem.
  */
 struct rw_semaphore {
+#ifdef CONFIG_RWSEM_PI
+	union {
+	struct {
+#endif
 	atomic_long_t count;
 	/*
 	 * Write owner or one of the read owners as well flags regarding
@@ -47,6 +56,14 @@ struct rw_semaphore {
 #endif
 	raw_spinlock_t wait_lock;
 	struct list_head wait_list;
+#ifdef CONFIG_RWSEM_PI
+	};
+	struct {
+		atomic_t readers;
+		struct rt_mutex gate;
+	} pi;
+	};
+#endif
 #ifdef CONFIG_DEBUG_RWSEMS
 	void *magic;
 #endif
@@ -55,9 +72,21 @@ struct rw_semaphore {
 #endif
 };
 
-/* In all implementations count != 0 means locked */
+static __always_inline bool rwsem_uses_pi(const struct rw_semaphore *sem)
+{
+#ifdef CONFIG_RWSEM_PI
+	return atomic_long_read(&sem->owner) & RT_MUTEX_PI_TAG;
+#else
+	return false;
+#endif
+}
+
 static inline int rwsem_is_locked(struct rw_semaphore *sem)
 {
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem))
+		return atomic_read(&sem->pi.readers) != RWSEM_PI_READER_BIAS;
+#endif
 	return atomic_long_read(&sem->count) != 0;
 }
 
@@ -110,14 +139,32 @@ do {								\
 	__init_rwsem((sem), #sem, &__key);			\
 } while (0)
 
-/*
- * This is the same regardless of which rwsem implementation that is being used.
- * It is just a heuristic meant to be called by somebody alreadying holding the
- * rwsem to see if somebody from an incompatible type is wanting access to the
- * lock.
- */
+#ifdef CONFIG_RWSEM_PI
+extern void __init_rwsem_pi(struct rw_semaphore *sem, const char *name,
+			   struct lock_class_key *key);
+#define init_rwsem_pi(sem) do { \
+	static struct lock_class_key __key; \
+	__init_rwsem_pi((sem), #sem, &__key); \
+} while (0)
+#define DECLARE_RWSEM_PI(name) \
+	struct rw_semaphore name = { \
+		.pi = { .readers = ATOMIC_INIT(RWSEM_PI_READER_BIAS), \
+			.gate = __RT_MUTEX_INITIALIZER_TAG(name.pi.gate, RT_MUTEX_PI_TAG) }, \
+		__RWSEM_DEBUG_INIT(name) \
+		__RWSEM_DEP_MAP_INIT(name) \
+	}
+#else
+#define init_rwsem_pi(sem)	init_rwsem(sem)
+#define DECLARE_RWSEM_PI(name)	DECLARE_RWSEM(name)
+#endif
+
+/* Heuristic for an incompatible holder or waiter, not a wait-queue query. */
 static inline int rwsem_is_contended(struct rw_semaphore *sem)
 {
+#ifdef CONFIG_RWSEM_PI
+	if (rwsem_uses_pi(sem))
+		return atomic_read(&sem->pi.readers) > 0;
+#endif
 	return !list_empty(&sem->wait_list);
 }
 
@@ -198,14 +245,18 @@ do {								\
  * [ This API should be avoided as much as possible - the
  *   proper abstraction for this case is completions. ]
  */
-extern void down_read_non_owner(struct rw_semaphore *sem);
-extern void up_read_non_owner(struct rw_semaphore *sem);
 #else
 # define down_read_nested(sem, subclass)		down_read(sem)
 # define down_read_killable_nested(sem, subclass)	down_read_killable(sem)
 # define down_write_nest_lock(sem, nest_lock)	down_write(sem)
 # define down_write_nested(sem, subclass)	down_write(sem)
 # define down_write_killable_nested(sem, subclass)	down_write_killable(sem)
+#endif
+
+#if defined(CONFIG_DEBUG_LOCK_ALLOC) || defined(CONFIG_RWSEM_PI)
+extern void down_read_non_owner(struct rw_semaphore *sem);
+extern void up_read_non_owner(struct rw_semaphore *sem);
+#else
 # define down_read_non_owner(sem)		down_read(sem)
 # define up_read_non_owner(sem)			up_read(sem)
 #endif

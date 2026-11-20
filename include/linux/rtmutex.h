@@ -27,7 +27,7 @@ extern int max_lock_depth; /* for sysctl */
  *              caches top-waiter (leftmost node).
  * @owner:	the mutex owner
  */
-#ifdef CONFIG_MUTEX_PI
+#if defined(CONFIG_MUTEX_PI) || defined(CONFIG_RWSEM_PI)
 /* Immutable for a published lock; does not mean the lock is held. */
 #define RT_MUTEX_PI_TAG		8UL
 #else
@@ -35,13 +35,13 @@ extern int max_lock_depth; /* for sysctl */
 #endif
 
 struct rt_mutex {
-#ifdef CONFIG_MUTEX_PI
-	/* Shares the owner word with the non-PI backend of struct mutex. */
+#if RT_MUTEX_PI_TAG
+	/* Shares the owner word with the enclosing mutex or rwsem. */
 	struct task_struct	*owner;
 #endif
 	raw_spinlock_t		wait_lock;
 	struct rb_root_cached   waiters;
-#ifndef CONFIG_MUTEX_PI
+#if !RT_MUTEX_PI_TAG
 	struct task_struct	*owner;
 #endif
 #ifdef CONFIG_DEBUG_RT_MUTEXES

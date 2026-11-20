@@ -237,6 +237,16 @@ config MUTEX_PI
 	  ww_mutexes, continue to use the normal mutex implementation.
 	  Without this option both PI initializers create normal mutexes.
 
+config RWSEM_PI
+	bool "Opt-in priority inheritance for rwsems"
+	depends on RT_MUTEXES
+	help
+	  Use an RT-Mutex admission gate for rwsems explicitly initialized
+	  with init_rwsem_pi() or DECLARE_RWSEM_PI(). An active writer can
+	  inherit priority; readers draining for a writer do not. PI instances
+	  must not use non-owner read operations. All other rwsems continue
+	  to use the native implementation.
+
 config RWSEM_SPIN_ON_OWNER
        def_bool y
        depends on SMP && ARCH_SUPPORTS_ATOMIC_RMW

@@ -1266,9 +1266,32 @@ static void rt_mutex_handle_deadlock(int res, int detect_deadlock,
 	}
 }
 
-/*
- * Slow path lock function:
- */
+/* The acquisition retry failed. The caller holds wait_lock with IRQs off. */
+static int __sched
+rt_mutex_wait_locked(struct rt_mutex *lock, int state,
+		     struct hrtimer_sleeper *timeout,
+		     enum rtmutex_chainwalk chwalk, struct rt_mutex_waiter *waiter)
+{
+	int ret;
+
+	set_current_state(state);
+	if (unlikely(timeout))
+		hrtimer_start_expires(&timeout->timer, HRTIMER_MODE_ABS);
+
+	ret = task_blocks_on_rt_mutex(lock, waiter, current, chwalk);
+	if (likely(!ret))
+		ret = __rt_mutex_slowlock(lock, state, timeout, waiter);
+
+	if (unlikely(ret)) {
+		__set_current_state(TASK_RUNNING);
+		remove_waiter(lock, waiter);
+		rt_mutex_handle_deadlock(ret, chwalk, lock, waiter);
+	}
+
+	fixup_rt_mutex_waiters(lock, true);
+	return ret;
+}
+
 static int __sched
 rt_mutex_slowlock(struct rt_mutex *lock, int state,
 		  struct hrtimer_sleeper *timeout,
@@ -1276,7 +1299,7 @@ rt_mutex_slowlock(struct rt_mutex *lock, int state,
 {
 	struct rt_mutex_waiter waiter;
 	unsigned long flags;
-	int ret = 0;
+	int ret;
 
 	rt_mutex_init_waiter(&waiter);
 
@@ -1296,30 +1319,7 @@ rt_mutex_slowlock(struct rt_mutex *lock, int state,
 		return 0;
 	}
 
-	set_current_state(state);
-
-	/* Setup the timer, when timeout != NULL */
-	if (unlikely(timeout))
-		hrtimer_start_expires(&timeout->timer, HRTIMER_MODE_ABS);
-
-	ret = task_blocks_on_rt_mutex(lock, &waiter, current, chwalk);
-
-	if (likely(!ret))
-		/* sleep on the mutex */
-		ret = __rt_mutex_slowlock(lock, state, timeout, &waiter);
-
-	if (unlikely(ret)) {
-		__set_current_state(TASK_RUNNING);
-		remove_waiter(lock, &waiter);
-		rt_mutex_handle_deadlock(ret, chwalk, lock, &waiter);
-	}
-
-	/*
-	 * try_to_take_rt_mutex() sets the waiter bit
-	 * unconditionally. We might have to fix that up.
-	 */
-	fixup_rt_mutex_waiters(lock, true);
-
+	ret = rt_mutex_wait_locked(lock, state, timeout, chwalk, &waiter);
 	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
 
 	/* Remove pending timer: */
@@ -1507,8 +1507,28 @@ rt_mutex_fastunlock(struct rt_mutex *lock, unsigned long tag,
 		rt_mutex_postunlock(&wake_q);
 }
 
-#ifdef CONFIG_MUTEX_PI
-/* Called with lockdep ownership recorded on the outer struct mutex. */
+#ifdef CONFIG_RWSEM_PI
+/* Caller retains wait_lock to publish its read count before releasing the gate. */
+int __sched rt_mutex_lock_locked_nolockdep(struct rt_mutex *lock, int state)
+{
+	struct rt_mutex_waiter waiter;
+	int ret;
+
+	lockdep_assert_held(&lock->wait_lock);
+	lockdep_assert_irqs_disabled();
+	if (try_to_take_rt_mutex(lock, current, NULL))
+		return 0;
+
+	rt_mutex_init_waiter(&waiter);
+	ret = rt_mutex_wait_locked(lock, state, NULL, RT_MUTEX_MIN_CHAINWALK,
+				   &waiter);
+	debug_rt_mutex_free_waiter(&waiter);
+	return ret;
+}
+#endif
+
+#if RT_MUTEX_PI_TAG
+/* Lockdep is recorded on the enclosing mutex or rwsem. */
 int __sched rt_mutex_lock_nolockdep(struct rt_mutex *lock, int state)
 {
 	return rt_mutex_fastlock(lock, state, RT_MUTEX_PI_TAG, rt_mutex_slowlock);

@@ -127,11 +127,14 @@ enum rtmutex_chainwalk {
 	RT_MUTEX_FULL_CHAINWALK,
 };
 
-/* The mutex API accounts for lockdep on struct mutex, not the backend. */
-#ifdef CONFIG_MUTEX_PI
+/* Lockdep accounts for the enclosing mutex or rwsem, not the backend. */
+#if RT_MUTEX_PI_TAG
 int rt_mutex_lock_nolockdep(struct rt_mutex *lock, int state);
 int rt_mutex_trylock_nolockdep(struct rt_mutex *lock);
 void rt_mutex_unlock_nolockdep(struct rt_mutex *lock);
+#endif
+#ifdef CONFIG_RWSEM_PI
+int rt_mutex_lock_locked_nolockdep(struct rt_mutex *lock, int state);
 #endif
 
 /*
