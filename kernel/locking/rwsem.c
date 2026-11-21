@@ -31,6 +31,7 @@
 #include "lock_events.h"
 #ifdef CONFIG_RWSEM_PI
 #include "rtmutex_common.h"
+#include "rwbase_pi.h"
 #endif
 
 /*
@@ -1369,144 +1370,43 @@ static inline void rwsem_pi_check_magic(struct rw_semaphore *sem)
 
 static inline bool rwsem_pi_read_trylock(struct rw_semaphore *sem)
 {
-	int count = atomic_read(&sem->pi.readers);
-
 	rwsem_pi_check_magic(sem);
-	while (count < 0) {
-		if (likely(atomic_try_cmpxchg_acquire(&sem->pi.readers, &count,
-						     count + 1)))
-			return true;
-	}
-	return false;
+	return rwbase_pi_read_trylock(&sem->pi.readers, &sem->pi.gate);
 }
 
-static noinline int __sched rwsem_pi_read_slowlock(struct rw_semaphore *sem,
-						   int state)
+static inline int rwsem_pi_read_lock(struct rw_semaphore *sem, int state)
 {
-	struct rt_mutex *gate = &sem->pi.gate;
-	int ret;
-
-	raw_spin_lock_irq(&gate->wait_lock);
-	ret = rt_mutex_lock_locked_nolockdep(gate, state);
-	if (!ret)
-		atomic_inc(&sem->pi.readers);
-	raw_spin_unlock_irq(&gate->wait_lock);
-	if (!ret)
-		rt_mutex_unlock_nolockdep(gate);
-	return ret;
-}
-
-static int __sched rwsem_pi_read_lock(struct rw_semaphore *sem, int state)
-{
-	if (likely(rwsem_pi_read_trylock(sem)))
-		return 0;
-	return rwsem_pi_read_slowlock(sem, state);
-}
-
-static noinline void rwsem_pi_wake_writer(struct rw_semaphore *sem)
-{
-	struct rt_mutex *gate = &sem->pi.gate;
-	unsigned long flags;
-	DEFINE_WAKE_Q(wake_q);
-
-	raw_spin_lock_irqsave(&gate->wait_lock, flags);
-	/* A writer may have already finished the drain or rolled it back. */
-	if (!atomic_read(&sem->pi.readers))
-		wake_q_add(&wake_q, rt_mutex_owner(gate));
-	raw_spin_unlock_irqrestore(&gate->wait_lock, flags);
-	wake_up_q(&wake_q);
+	rwsem_pi_check_magic(sem);
+	return rwbase_pi_read_lock(&sem->pi.readers, &sem->pi.gate, state);
 }
 
 static inline void rwsem_pi_read_unlock(struct rw_semaphore *sem)
 {
 	rwsem_pi_check_magic(sem);
-	/* Publish this reader's critical section, including the last exit. */
-	if (unlikely(atomic_dec_and_test(&sem->pi.readers)))
-		rwsem_pi_wake_writer(sem);
+	rwbase_pi_read_unlock(&sem->pi.readers, &sem->pi.gate);
 }
 
-static bool rwsem_pi_finish_drain(struct rw_semaphore *sem)
+static inline int rwsem_pi_write_lock(struct rw_semaphore *sem, int state)
 {
-	if (atomic_read_acquire(&sem->pi.readers))
-		return false;
-	atomic_set(&sem->pi.readers, RWSEM_PI_WRITER_BIAS);
-	return true;
-}
-
-static void rwsem_pi_reopen(struct rw_semaphore *sem, int delta)
-{
-	/* Preserve concurrent reader exits; publish to fast-path readers. */
-	atomic_add_return_release(delta, &sem->pi.readers);
-}
-
-static int __sched rwsem_pi_write_lock(struct rw_semaphore *sem, int state)
-{
-	struct rt_mutex *gate = &sem->pi.gate;
-	int ret;
-
 	rwsem_pi_check_magic(sem);
-	ret = rt_mutex_lock_nolockdep(gate, state);
-	if (ret)
-		return ret;
-
-	raw_spin_lock_irq(&gate->wait_lock);
-	(void)atomic_sub_return(RWSEM_PI_READER_BIAS, &sem->pi.readers);
-	for (;;) {
-		set_current_state(state);
-		if (rwsem_pi_finish_drain(sem)) {
-			__set_current_state(TASK_RUNNING);
-			raw_spin_unlock_irq(&gate->wait_lock);
-			return 0;
-		}
-		if (signal_pending_state(state, current))
-			break;
-		raw_spin_unlock_irq(&gate->wait_lock);
-		schedule();
-		raw_spin_lock_irq(&gate->wait_lock);
-	}
-	__set_current_state(TASK_RUNNING);
-	rwsem_pi_reopen(sem, RWSEM_PI_READER_BIAS);
-	raw_spin_unlock_irq(&gate->wait_lock);
-	rt_mutex_unlock_nolockdep(gate);
-	return -EINTR;
+	return rwbase_pi_write_lock(&sem->pi.readers, &sem->pi.gate, state);
 }
 
-static bool rwsem_pi_write_trylock(struct rw_semaphore *sem)
+static inline bool rwsem_pi_write_trylock(struct rw_semaphore *sem)
 {
-	struct rt_mutex *gate = &sem->pi.gate;
-	unsigned long flags;
-	bool locked;
-
 	rwsem_pi_check_magic(sem);
-	if (!rt_mutex_trylock_nolockdep(gate))
-		return false;
-	raw_spin_lock_irqsave(&gate->wait_lock, flags);
-	(void)atomic_sub_return(RWSEM_PI_READER_BIAS, &sem->pi.readers);
-	locked = rwsem_pi_finish_drain(sem);
-	if (!locked)
-		rwsem_pi_reopen(sem, RWSEM_PI_READER_BIAS);
-	raw_spin_unlock_irqrestore(&gate->wait_lock, flags);
-	if (!locked)
-		rt_mutex_unlock_nolockdep(gate);
-	return locked;
+	return rwbase_pi_write_trylock(&sem->pi.readers, &sem->pi.gate);
 }
 
-static void rwsem_pi_write_release(struct rw_semaphore *sem, bool downgrade)
+static inline void rwsem_pi_write_release(struct rw_semaphore *sem, bool downgrade)
 {
-	struct rt_mutex *gate = &sem->pi.gate;
-	unsigned long flags;
-	int delta = (int)((unsigned int)RWSEM_PI_READER_BIAS -
-			  RWSEM_PI_WRITER_BIAS + downgrade);
-
 	rwsem_pi_check_magic(sem);
 #ifdef CONFIG_DEBUG_RWSEMS
-	DEBUG_LOCKS_WARN_ON(rt_mutex_owner(gate) != current);
+	DEBUG_LOCKS_WARN_ON(rt_mutex_owner(&sem->pi.gate) != current);
 #endif
-	raw_spin_lock_irqsave(&gate->wait_lock, flags);
-	rwsem_pi_reopen(sem, delta);
-	raw_spin_unlock_irqrestore(&gate->wait_lock, flags);
-	rt_mutex_unlock_nolockdep(gate);
+	rwbase_pi_write_release(&sem->pi.readers, &sem->pi.gate, downgrade);
 }
+
 #endif /* CONFIG_RWSEM_PI */
 
 /*

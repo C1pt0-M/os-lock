@@ -133,7 +133,7 @@ int rt_mutex_lock_nolockdep(struct rt_mutex *lock, int state);
 int rt_mutex_trylock_nolockdep(struct rt_mutex *lock);
 void rt_mutex_unlock_nolockdep(struct rt_mutex *lock);
 #endif
-#ifdef CONFIG_RWSEM_PI
+#if defined(CONFIG_RWSEM_PI) || defined(CONFIG_RWLOCK_PI)
 int rt_mutex_lock_locked_nolockdep(struct rt_mutex *lock, int state);
 #endif
 

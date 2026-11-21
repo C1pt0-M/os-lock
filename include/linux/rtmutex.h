@@ -27,7 +27,7 @@ extern int max_lock_depth; /* for sysctl */
  *              caches top-waiter (leftmost node).
  * @owner:	the mutex owner
  */
-#if defined(CONFIG_MUTEX_PI) || defined(CONFIG_RWSEM_PI)
+#if defined(CONFIG_MUTEX_PI) || defined(CONFIG_RWSEM_PI) || defined(CONFIG_RWLOCK_PI)
 /* Immutable for a published lock; does not mean the lock is held. */
 #define RT_MUTEX_PI_TAG		8UL
 #else

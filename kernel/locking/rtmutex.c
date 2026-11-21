@@ -1507,7 +1507,7 @@ rt_mutex_fastunlock(struct rt_mutex *lock, unsigned long tag,
 		rt_mutex_postunlock(&wake_q);
 }
 
-#ifdef CONFIG_RWSEM_PI
+#if defined(CONFIG_RWSEM_PI) || defined(CONFIG_RWLOCK_PI)
 /* Caller retains wait_lock to publish its read count before releasing the gate. */
 int __sched rt_mutex_lock_locked_nolockdep(struct rt_mutex *lock, int state)
 {

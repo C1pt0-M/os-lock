@@ -32,3 +32,7 @@ obj-$(CONFIG_QUEUED_RWLOCKS) += qrwlock.o
 obj-$(CONFIG_LOCK_TORTURE_TEST) += locktorture.o
 obj-$(CONFIG_WW_MUTEX_SELFTEST) += test-ww_mutex.o
 obj-$(CONFIG_LOCK_EVENT_COUNTS) += lock_events.o
+
+ifneq ($(filter y,$(CONFIG_RWSEM_PI) $(CONFIG_RWLOCK_PI)),)
+obj-y += rwbase_pi.o
+endif
