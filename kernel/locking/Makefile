@@ -36,3 +36,5 @@ obj-$(CONFIG_LOCK_EVENT_COUNTS) += lock_events.o
 ifneq ($(filter y,$(CONFIG_RWSEM_PI) $(CONFIG_RWLOCK_PI)),)
 obj-y += rwbase_pi.o
 endif
+
+obj-$(CONFIG_RWLOCK_PI) += rwlock_pi.o

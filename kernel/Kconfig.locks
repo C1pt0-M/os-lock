@@ -247,6 +247,18 @@ config RWSEM_PI
 	  must not use non-owner read operations. All other rwsems continue
 	  to use the native implementation.
 
+config RWLOCK_PI
+	bool "Task-context opt-in PI reader/writer locks"
+	default n
+	depends on RT_MUTEXES && PREEMPT_COUNT
+	help
+	  Provide rwlock_pi_t for explicitly initialized task-context PI locks.
+	  Only TASK_RUNNING, sleepable process context with interrupts enabled
+	  is supported. Locks may migrate; recursive locking, upgrades, BH/IRQ
+	  variants and implicit per-CPU/RCU protection are not supported.
+	  Without this option the type and six operations map to native rwlock_t;
+	  callers must also obey native non-sleeping critical-section rules.
+
 config RWSEM_SPIN_ON_OWNER
        def_bool y
        depends on SMP && ARCH_SUPPORTS_ATOMIC_RMW
